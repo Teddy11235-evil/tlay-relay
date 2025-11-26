@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Koyeb-Compatible Relay Server with HTTP Health Checks
+Koyeb Relay Server - Fixed Version with Separate HTTP/WebSocket
 """
 import asyncio
 import websockets
@@ -10,6 +10,7 @@ import os
 from datetime import datetime
 import uuid
 from aiohttp import web
+import threading
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -212,74 +213,71 @@ class KoyebRelay:
                 'node_name': node_name
             })
 
-# HTTP routes for health checks
+# HTTP Server for Health Checks
 async def health_check(request):
     """Handle Koyeb health checks"""
     return web.Response(text="OK", status=200)
 
 async def status(request):
     """Status page with relay information"""
-    relay = request.app['relay']
-    status_info = {
+    return web.json_response({
         'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat() + 'Z',
-        'stats': {
-            'controllers_connected': len(relay.controllers),
-            'nodes_connected': len(relay.nodes),
-            'total_nodes_registered': len(relay.node_info)
-        },
-        'nodes': list(relay.node_info.values())
-    }
-    return web.json_response(status_info)
+        'service': 'render-farm-relay',
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    })
 
-async def websocket_handler(request):
-    """Handle WebSocket upgrade requests"""
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-    
-    relay = request.app['relay']
-    await relay.handle_websocket(ws, request.path)
-    
-    return ws
-
-async def create_app():
-    """Create aiohttp application"""
+async def start_http_server():
+    """Start HTTP server for health checks"""
     app = web.Application()
-    
-    # Store relay instance in app
-    relay = KoyebRelay()
-    app['relay'] = relay
-    
-    # Add routes
     app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
     app.router.add_get('/status', status)
-    app.router.add_get('/ws', websocket_handler)  # WebSocket endpoint
     
-    return app
-
-async def main():
-    """Main application entry point"""
     port = int(os.getenv('PORT', 8000))
-    
-    # Create aiohttp app
-    app = await create_app()
-    
-    # Create aiohttp runner
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # Create TCP site
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     
-    logger.info(f"🚀 Koyeb Relay Server running on port {port}")
-    logger.info("📡 WebSocket URL: wss://your-app-name.koyeb.app/ws")
-    logger.info("🏥 Health check: https://your-app-name.koyeb.app/health")
+    logger.info(f"🏥 HTTP Server running on port {port}")
+    logger.info("🔍 Health check: https://your-app-name.koyeb.app/health")
+    return runner
+
+async def start_websocket_server():
+    """Start WebSocket server on a different port"""
+    relay = KoyebRelay()
+    
+    # Use a different port for WebSockets to avoid conflicts
+    ws_port = int(os.getenv('WS_PORT', 8001))
+    
+    # Start WebSocket server
+    ws_server = await websockets.serve(
+        relay.handle_websocket,
+        "0.0.0.0",
+        ws_port,
+        ping_interval=20,
+        ping_timeout=10
+    )
+    
+    logger.info(f"📡 WebSocket Server running on port {ws_port}")
+    logger.info("🌐 WebSocket URL: wss://your-app-name.koyeb.app:8001")
     logger.info("💚 Ready for controllers and nodes!")
     
-    # Run forever
-    await asyncio.Future()
+    return ws_server
+
+async def main():
+    """Main application entry point"""
+    # Start both servers
+    http_runner = await start_http_server()
+    ws_server = await start_websocket_server()
+    
+    # Keep both servers running
+    try:
+        await asyncio.Future()  # Run forever
+    finally:
+        await ws_server.wait_closed()
+        await http_runner.cleanup()
 
 if __name__ == "__main__":
     try:
