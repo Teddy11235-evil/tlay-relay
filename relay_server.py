@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Koyeb-Optimized Relay Server
+Koyeb-Compatible Relay Server with HTTP Health Checks
 """
 import asyncio
 import websockets
@@ -9,6 +9,7 @@ import logging
 import os
 from datetime import datetime
 import uuid
+from aiohttp import web
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -20,9 +21,10 @@ class KoyebRelay:
         self.nodes = {}
         self.node_info = {}
         
-    async def handle_connection(self, websocket, path):
+    async def handle_websocket(self, websocket, path):
+        """Handle WebSocket connections"""
         client_ip = websocket.remote_address[0] if websocket.remote_address else 'unknown'
-        logger.info(f"New connection from {client_ip}")
+        logger.info(f"WebSocket connection from {client_ip}")
         
         try:
             # Wait for client identification
@@ -38,13 +40,14 @@ class KoyebRelay:
                 await websocket.close(1008, "Invalid client type")
                 
         except asyncio.TimeoutError:
-            logger.warning(f"Connection timeout from {client_ip}")
+            logger.warning(f"WebSocket timeout from {client_ip}")
         except json.JSONDecodeError:
             logger.warning(f"Invalid JSON from {client_ip}")
         except Exception as e:
-            logger.error(f"Connection error: {e}")
+            logger.error(f"WebSocket error: {e}")
 
     async def handle_controller(self, websocket, data):
+        """Handle controller connection"""
         controller_id = str(uuid.uuid4())
         self.controllers.add(websocket)
         
@@ -76,6 +79,7 @@ class KoyebRelay:
             logger.info(f"Controller disconnected: {controller_id}")
 
     async def handle_node(self, websocket, data):
+        """Handle node connection"""
         node_id = str(uuid.uuid4())
         node_name = data.get('node_name', f'node-{node_id[:8]}')
         
@@ -118,6 +122,7 @@ class KoyebRelay:
             await self.cleanup_node(node_id)
 
     async def process_controller_command(self, controller_id, data):
+        """Process commands from controllers"""
         if data.get('type') == 'command':
             node_name = data.get('node_name')
             command = data.get('command')
@@ -154,6 +159,7 @@ class KoyebRelay:
                 })
 
     async def process_node_message(self, node_id, data):
+        """Process messages from nodes"""
         if data.get('type') == 'heartbeat':
             # Update heartbeat
             if node_id in self.node_info:
@@ -174,7 +180,6 @@ class KoyebRelay:
         """Send message to specific controller"""
         for controller in self.controllers:
             try:
-                # We'd need to track controller IDs better in production
                 await controller.send(json.dumps(message))
                 break
             except:
@@ -193,6 +198,7 @@ class KoyebRelay:
             self.controllers.discard(controller)
 
     async def cleanup_node(self, node_id):
+        """Clean up node resources"""
         if node_id in self.nodes:
             del self.nodes[node_id]
             
@@ -206,24 +212,70 @@ class KoyebRelay:
                 'node_name': node_name
             })
 
+# HTTP routes for health checks
+async def health_check(request):
+    """Handle Koyeb health checks"""
+    return web.Response(text="OK", status=200)
+
+async def status(request):
+    """Status page with relay information"""
+    relay = request.app['relay']
+    status_info = {
+        'status': 'healthy',
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        'stats': {
+            'controllers_connected': len(relay.controllers),
+            'nodes_connected': len(relay.nodes),
+            'total_nodes_registered': len(relay.node_info)
+        },
+        'nodes': list(relay.node_info.values())
+    }
+    return web.json_response(status_info)
+
+async def websocket_handler(request):
+    """Handle WebSocket upgrade requests"""
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    
+    relay = request.app['relay']
+    await relay.handle_websocket(ws, request.path)
+    
+    return ws
+
+async def create_app():
+    """Create aiohttp application"""
+    app = web.Application()
+    
+    # Store relay instance in app
+    relay = KoyebRelay()
+    app['relay'] = relay
+    
+    # Add routes
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    app.router.add_get('/status', status)
+    app.router.add_get('/ws', websocket_handler)  # WebSocket endpoint
+    
+    return app
+
 async def main():
-    # Koyeb provides PORT environment variable
+    """Main application entry point"""
     port = int(os.getenv('PORT', 8000))
     
-    relay = KoyebRelay()
+    # Create aiohttp app
+    app = await create_app()
     
-    # Start WebSocket server
-    server = await websockets.serve(
-        relay.handle_connection,
-        "0.0.0.0",  # Important: Listen on all interfaces
-        port,
-        ping_interval=20,
-        ping_timeout=10,
-        max_size=10 * 1024 * 1024  # 10MB max message size
-    )
+    # Create aiohttp runner
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Create TCP site
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
     
     logger.info(f"🚀 Koyeb Relay Server running on port {port}")
-    logger.info(f"📡 WebSocket URL: wss://your-app-name.koyeb.app")
+    logger.info("📡 WebSocket URL: wss://your-app-name.koyeb.app/ws")
+    logger.info("🏥 Health check: https://your-app-name.koyeb.app/health")
     logger.info("💚 Ready for controllers and nodes!")
     
     # Run forever
