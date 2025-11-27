@@ -9,14 +9,10 @@ services:
       type: dockerfile
     ports:
       - port: 8000
-        http_path: /health  # Health check endpoint
+        http_path: /health
         protocol: http
     regions:
       - fra
     scalings:
       - min: 1
         max: 1
-    deployments:
-      - name: always-free
-        enable: true
-        public: true
