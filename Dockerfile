@@ -9,4 +9,4 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["python", "relay_server_koyeb.py"]
+CMD ["python", "relay_server.py"]
