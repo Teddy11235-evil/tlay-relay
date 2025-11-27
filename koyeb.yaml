@@ -4,11 +4,11 @@ services:
     type: web
     env:
       - name: PORT
-        value: "8000"
+        value: "8080"  # Changed from 8000 to 8080
     build:
       type: dockerfile
     ports:
-      - port: 8000
+      - port: 8080     # Changed from 8000 to 8080
         http_path: /health
         protocol: http
     regions:
