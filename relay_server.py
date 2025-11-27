@@ -268,7 +268,7 @@ async def create_app():
 
 async def main():
     """Main application entry point"""
-    port = int(os.getenv('PORT', 8000))
+    port = int(os.getenv('PORT', 8080))
     
     app = await create_app()
     runner = web.AppRunner(app)
